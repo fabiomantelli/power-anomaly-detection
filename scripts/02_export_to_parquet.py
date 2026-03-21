@@ -52,9 +52,16 @@ def connect(host: str, instance_name: str) -> tuple:
     return historian, instance, name
 
 
+BATCH_SIZE = 2_000_000  # registros por batch (~48 MB em listas Python)
+
+
 def export_day(host: str, instance_name: str, point_id_list: list[int], date: datetime, out_file: Path) -> int:
-    """Abre uma conexão nova, exporta um dia e grava Parquet. Retorna número de registros."""
+    """Abre uma conexão nova, exporta um dia gravando em batches. Retorna número de registros."""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = out_file.with_suffix(".tmp.parquet")
+
     historian, instance, _ = connect(host, instance_name)
+    total = 0
     try:
         next_day = date + timedelta(days=1)
         time_filter  = timestampSeekFilter.CreateFromRange(date, next_day)
@@ -67,11 +74,32 @@ def export_day(host: str, instance_name: str, point_id_list: list[int], date: da
         val_list: list[float] = []
         qfl_list: list[int]   = []
 
+        def flush(writer_ref: list) -> None:
+            table = pa.table(
+                {"timestamp_us": ts_list, "point_id": pid_list,
+                 "value": val_list, "quality": qfl_list},
+                schema=SCHEMA,
+            )
+            if not writer_ref:
+                writer_ref.append(pq.ParquetWriter(tmp_file, SCHEMA, compression="snappy"))
+            writer_ref[0].write_table(table)
+            ts_list.clear(); pid_list.clear(); val_list.clear(); qfl_list.clear()
+
+        writer_ref: list = []
         while reader.Read(key, value):
             ts_list.append(int(key.AsDateTime.timestamp() * 1_000_000))
             pid_list.append(int(key.PointID))
             val_list.append(float(value.AsSingle))
             qfl_list.append(int(value.AsQuality.value))
+            total += 1
+            if len(ts_list) >= BATCH_SIZE:
+                flush(writer_ref)
+
+        if ts_list:
+            flush(writer_ref)
+
+        if writer_ref:
+            writer_ref[0].close()
     finally:
         try:
             instance.Dispose()
@@ -79,22 +107,14 @@ def export_day(host: str, instance_name: str, point_id_list: list[int], date: da
         except Exception:
             pass
 
-    if not ts_list:
+    if total == 0:
         log.warning("Nenhum dado para %s", date.date())
+        if tmp_file.exists():
+            tmp_file.unlink()
         return 0
 
-    table = pa.table(
-        {
-            "timestamp_us": ts_list,
-            "point_id":     pid_list,
-            "value":        val_list,
-            "quality":      qfl_list,
-        },
-        schema=SCHEMA,
-    )
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, out_file, compression="snappy")
-    return len(ts_list)
+    tmp_file.rename(out_file)
+    return total
 
 
 def main():
