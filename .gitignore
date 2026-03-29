@@ -1,0 +1,32 @@
+# Claude Code local config
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / outputs (adjust if you want to track some)
+*.parquet
+*.csv
+*.h5
+*.hdf5
+data/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env vars
+.env
+*.env

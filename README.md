@@ -1,34 +1,44 @@
-# AI para Detecção de Anomalias em Sincrofasores 50 Hz
+# Unsupervised Anomaly Detection for 50 Hz Synchrophasor Networks
 
-Detecção não supervisionada de anomalias em dados de PMU (Phase Measurement Units) das redes de 50 Hz do **Chile** e da **Argentina**, usando o modelo [IBM TSPulse](https://huggingface.co/ibm-granite/granite-timeseries-tspulse-r1).
+Detects anomalies in PMU (Phasor Measurement Unit) data from the **Chile** and **Argentina** 50 Hz transmission grids using [IBM Granite TSPulse](https://huggingface.co/ibm-granite/granite-timeseries-tspulse-r1) — a zero-shot, dual-domain (time + spectral) time-series foundation model ranked #1 on the TSB-AD benchmark.
 
 ---
 
-## Visão geral
+## Overview
 
-| Item | Detalhe |
+| | |
 |---|---|
-| Fonte de dados | openHistorian 2 (servidor remoto via VPN) |
-| Taxa de amostragem | 60 amostras/segundo por PMU |
-| PMUs | 5–20 unidades (Chile + Argentina) |
-| Canais por PMU | 8 (Va/Vb/Vc magnitude e ângulo, freq, ROCOF) |
-| Período | 2 anos (2022–2023) |
-| Modelo | TSPulse — 1 M parâmetros, zero-shot, domínio dual temporal+espectral |
-| Hardware de treinamento | GPU alugada no vast.ai (H100 80 GB) |
+| **Data source** | openHistorian 2 (remote server via VPN) |
+| **Sampling rate** | 60 samples/sec per PMU |
+| **PMUs** | 5–20 units (Chile + Argentina) |
+| **Channels per PMU** | 8 (Va/Vb/Vc magnitude & angle, freq, ROCOF) |
+| **Period** | 2 years (2022–2023) |
+| **Model** | TSPulse — 1M parameters, zero-shot |
+| **Training hardware** | vast.ai H100 80 GB |
 
 ---
 
-## Pré-requisitos
+## Tech Stack
 
-### Ambiente local (exportação)
+- **Python 3.11**, PyTorch 2.5, HuggingFace Transformers
+- **IBM Granite TSPulse** (`granite-tsfm`) — time-series foundation model
+- **Apache Parquet** (PyArrow) — partitioned columnar storage
+- **openHistorian 2** — PMU data historian
+- **vast.ai** — on-demand GPU cloud (H100)
+
+---
+
+## Prerequisites
+
+### Local environment (data export)
 
 ```bash
 pip install openhistorian pyarrow>=17 pandas numpy tqdm
 ```
 
-### Ambiente cloud — vast.ai (treinamento e inferência)
+### Cloud environment — vast.ai (training & inference)
 
-Imagem Docker recomendada: `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel`
+Recommended Docker image: `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel`
 
 ```bash
 conda create -n pmu-ai python=3.11 && conda activate pmu-ai
@@ -38,21 +48,21 @@ pip install "granite-tsfm[notebooks] @ git+https://github.com/ibm-granite/granit
 
 ---
 
-## O que precisa ser feito
+## Pipeline
 
-### Fase 1 — Configuração inicial (fazer uma vez)
+### Phase 1 — Setup (run once)
 
-#### 1. Mapear os sinais disponíveis no openHistorian
+#### 1. Map available signals from openHistorian
 
-Conectar ao servidor via VPN e rodar o script de discovery:
+Connect via VPN and run the discovery script:
 
 ```bash
 python scripts/01_list_signals.py --host 192.168.x.x
 ```
 
-Isso cria/atualiza `configs/signals.json` com todos os point IDs das PMUs.
+This creates/updates `configs/signals.json` with all PMU point IDs.
 
-**Ação manual necessária:** abrir `scripts/01_list_signals.py` e preencher o dicionário `DEVICE_COUNTRY` com os acrônimos reais de cada PMU e o país correspondente (Chile ou Argentina). Exemplo:
+**Manual step:** open `scripts/01_list_signals.py` and fill in the `DEVICE_COUNTRY` dictionary with each PMU's acronym and country. Example:
 
 ```python
 DEVICE_COUNTRY = {
@@ -64,21 +74,21 @@ DEVICE_COUNTRY = {
 
 ---
 
-### Fase 2 — Exportação de dados (rodar localmente com VPN ativa)
+### Phase 2 — Data Export (run locally with VPN active)
 
-#### 2. Exportar dados do openHistorian para Parquet
+#### 2. Export openHistorian data to Parquet
 
-Formato de saída: `D:/openHistorian_export/year=YYYY/month=MM/day=DD/data.parquet`
+Output format: `D:/openHistorian_export/year=YYYY/month=MM/day=DD/data.parquet`
 
 ```bash
-# Testar com 1 dia antes de rodar o período completo:
+# Test with 1 day before running the full range:
 python scripts/02_export_to_parquet.py \
     --host  192.168.x.x \
     --start 2022-01-01 \
     --end   2022-01-02 \
     --output D:/openHistorian_export
 
-# Exportação completa (pode ser dividida em semestres e rodar em paralelo):
+# Full export (can be split by semester and run in parallel):
 python scripts/02_export_to_parquet.py \
     --host  192.168.x.x \
     --start 2022-01-01 \
@@ -86,23 +96,23 @@ python scripts/02_export_to_parquet.py \
     --output D:/openHistorian_export
 ```
 
-> O script retoma automaticamente a partir do último dia exportado em caso de falha.
+> The script automatically resumes from the last successfully exported day on failure.
 >
-> Volume estimado (10 PMUs × 8 canais, 2 anos): **15–25 GB** em Parquet Snappy.
-> Tempo estimado: 8–15 horas. Para acelerar, rodar dois processos em paralelo com semestres distintos.
+> Estimated volume (10 PMUs × 8 channels, 2 years): **15–25 GB** in Parquet Snappy.
+> To speed things up, run two processes in parallel with distinct semesters.
 
-**Verificação:**
+**Verify:**
 
 ```python
 import pyarrow.dataset as ds
 d = ds.dataset("D:/openHistorian_export", format="parquet")
-print(d.count_rows())   # deve ser ~302 bilhões para 10 PMUs / 2 anos
+print(d.count_rows())  # ~302 billion rows for 10 PMUs / 2 years
 print(d.schema)
 ```
 
-#### 3. Converter de formato longo para largo (wide)
+#### 3. Pivot from long to wide format
 
-Agrupa os point IDs como colunas. Saída: `D:/export_wide/year=YYYY/month=MM/data.parquet`
+Groups point IDs as columns. Output: `D:/export_wide/year=YYYY/month=MM/data.parquet`
 
 ```bash
 python scripts/03_pivot_wide.py \
@@ -110,35 +120,35 @@ python scripts/03_pivot_wide.py \
     --output D:/export_wide
 ```
 
-> Para processar apenas um mês específico: `--year 2022 --month 3`
+> To process a specific month only: `--year 2022 --month 3`
 
-**Verificação:**
+**Verify:**
 
 ```python
 import pandas as pd
 df = pd.read_parquet("D:/export_wide/year=2022/month=01/data.parquet")
 print(df.shape)    # (N_timestamps, N_channels + 1)
-print(df.columns)  # timestamp_us + um ponto ID por coluna
+print(df.columns)  # timestamp_us + one column per point ID
 ```
 
 ---
 
-### Fase 3 — Treinamento (rodar na instância vast.ai)
+### Phase 3 — Training (run on vast.ai instance)
 
-#### 4. Transferir dados para o vast.ai
+#### 4. Transfer data to vast.ai
 
-No painel do [vast.ai](https://vast.ai), provisionar uma instância com H100 80 GB e obter IP/porta SSH.
+Provision an H100 80 GB instance on [vast.ai](https://vast.ai) and get the SSH IP/port.
 
 ```bash
 rsync -avz --progress -e "ssh -p <VAST_PORT>" \
       D:/export_wide/ root@<VAST_IP>:/workspace/pmu_data/
 ```
 
-> Para volumes > 100 GB, considerar vast.ai Persistent Storage.
+> For volumes > 100 GB, consider vast.ai Persistent Storage.
 
-#### 5. Ajustar o preprocessor (Z-score por canal)
+#### 5. Fit the preprocessor (per-channel Z-score)
 
-Usar um mês de operação normal (sem eventos conhecidos) para estimar média e desvio padrão de cada canal:
+Use one month of known-normal operation to estimate mean and standard deviation per channel:
 
 ```bash
 python scripts/04_fit_preprocessor.py \
@@ -147,13 +157,13 @@ python scripts/04_fit_preprocessor.py \
     --output   checkpoints/pmu_preprocessor
 ```
 
-**Verificação esperada nos logs:**
-- Canal `FREQ`: média ≈ 50.0 Hz, desvio padrão ≈ 0.05–0.2 Hz
-- Canais `VPHM`: média ≈ 1.0 pu, desvio padrão ≈ 0.01–0.05 pu
+**Expected log values:**
+- `FREQ` channel: mean ≈ 50.0 Hz, std ≈ 0.05–0.2 Hz
+- `VPHM` channels: mean ≈ 1.0 pu, std ≈ 0.01–0.05 pu
 
-#### 6. Fine-tuning do TSPulse em dados normais
+#### 6. Fine-tune TSPulse on normal data
 
-O modelo aprende a reconstruir séries normais. Anomalias = alta perda de reconstrução.
+The model learns to reconstruct normal series. Anomalies surface as high reconstruction loss.
 
 ```bash
 python scripts/05_finetune_tspulse.py \
@@ -165,26 +175,26 @@ python scripts/05_finetune_tspulse.py \
     --batch-size   64
 ```
 
-> Checkpoints são salvos por época em `checkpoints/tspulse_pmu_finetuned/epoch_XX/`.
-> Monitorar loss com TensorBoard: `tensorboard --logdir checkpoints/tspulse_pmu_finetuned`
+> Checkpoints are saved per epoch under `checkpoints/tspulse_pmu_finetuned/epoch_XX/`.
+> Monitor loss with TensorBoard: `tensorboard --logdir checkpoints/tspulse_pmu_finetuned`
 
-**Verificação:** a loss de reconstrução deve decrescer a cada época.
+**Expected:** reconstruction loss decreases each epoch.
 
 ---
 
-### Fase 4 — Detecção de anomalias (inferência)
+### Phase 4 — Anomaly Detection (inference)
 
-#### 7. Rodar o pipeline de scoring
+#### 7. Run the scoring pipeline
 
 ```bash
-# Zero-shot (sem fine-tuning, para validação inicial):
+# Zero-shot (no fine-tuning, for initial validation):
 python scripts/06_anomaly_detection.py \
     --data-glob "/workspace/pmu_data/year=2023/month=01/data.parquet" \
     --model     ibm-granite/granite-timeseries-tspulse-r1 \
     --preprocessor checkpoints/pmu_preprocessor \
     --output    results/scores_zeroshot_2023_01.parquet
 
-# Com fine-tuning:
+# Fine-tuned model:
 python scripts/06_anomaly_detection.py \
     --data-glob "/workspace/pmu_data/year=2023/month=*/data.parquet" \
     --model     checkpoints/tspulse_pmu_finetuned/model \
@@ -193,60 +203,60 @@ python scripts/06_anomaly_detection.py \
     --threshold 3.0
 ```
 
-O arquivo de saída contém `timestamp_us`, `anomaly_score` e `anomaly_flag` (1 = anomalia detectada).
+Output contains `timestamp_us`, `anomaly_score`, and `anomaly_flag` (`1` = anomaly detected).
 
-**Verificação:** em operação normal, `anomaly_flag` deve ser próximo de 0%. Eventos de rede (quedas de frequência, desequilíbrio de tensão) devem produzir picos claros no `anomaly_score`.
+**Expected behavior:** `anomaly_flag` near 0% during normal operation. Grid events (frequency dips, voltage imbalance) should produce clear spikes in `anomaly_score`.
 
 ---
 
-## Estrutura de arquivos
+## Repository Structure
 
 ```
-ai-detection-50hz/
+power-anomaly-detection/
   configs/
-    signals.json              # Mapeamento point_id → sinal/PMU/país (gerado por 01)
+    signals.json              # point_id → signal/PMU/country mapping (generated by 01)
   scripts/
-    01_list_signals.py        # Discovery de sinais no openHistorian
-    02_export_to_parquet.py   # Exportação diária (long format)
-    03_pivot_wide.py          # Conversão long → wide por mês
-    04_fit_preprocessor.py    # Ajuste do Z-score por canal
-    05_finetune_tspulse.py    # Fine-tuning do TSPulse
-    06_anomaly_detection.py   # Inferência e scoring de anomalias
+    01_list_signals.py        # Signal discovery from openHistorian
+    02_export_to_parquet.py   # Daily export (long format)
+    03_pivot_wide.py          # Long → wide pivot by month
+    04_fit_preprocessor.py    # Per-channel Z-score fitting
+    05_finetune_tspulse.py    # TSPulse fine-tuning
+    06_anomaly_detection.py   # Inference and anomaly scoring
   src/
-    pmu_dataset.py            # PMUSlidingWindowDataset (streaming, IterableDataset)
+    pmu_dataset.py            # PMUSlidingWindowDataset (streaming IterableDataset)
   checkpoints/
-    pmu_preprocessor/         # Escaladores por canal (gerado por 04)
-    tspulse_pmu_finetuned/    # Modelo fine-tuned + checkpoints por época (gerado por 05)
-  results/                    # Parquet de scores de anomalia (gerado por 06)
+    pmu_preprocessor/         # Per-channel scalers (generated by 04)
+    tspulse_pmu_finetuned/    # Fine-tuned model + per-epoch checkpoints (generated by 05)
+  results/                    # Anomaly score Parquet files (generated by 06)
   requirements.txt
 ```
 
 ---
 
-## Canais PMU
+## PMU Channels
 
-| Canal | Sinal | Tipo openHistorian |
+| Channel | Signal | openHistorian type |
 |---|---|---|
-| `va_mag` | Tensão fase A — magnitude (pu) | `VPHM` |
-| `vb_mag` | Tensão fase B — magnitude (pu) | `VPHM` |
-| `vc_mag` | Tensão fase C — magnitude (pu) | `VPHM` |
-| `va_ang` | Tensão fase A — ângulo (graus) | `VPHA` |
-| `vb_ang` | Tensão fase B — ângulo (graus) | `VPHA` |
-| `vc_ang` | Tensão fase C — ângulo (graus) | `VPHA` |
-| `freq`   | Frequência do sistema (Hz) | `FREQ` |
+| `va_mag` | Phase A voltage — magnitude (pu) | `VPHM` |
+| `vb_mag` | Phase B voltage — magnitude (pu) | `VPHM` |
+| `vc_mag` | Phase C voltage — magnitude (pu) | `VPHM` |
+| `va_ang` | Phase A voltage — angle (degrees) | `VPHA` |
+| `vb_ang` | Phase B voltage — angle (degrees) | `VPHA` |
+| `vc_ang` | Phase C voltage — angle (degrees) | `VPHA` |
+| `freq`   | System frequency (Hz) | `FREQ` |
 | `dfreq`  | ROCOF — df/dt (Hz/s) | `ROCOF` |
 
 ---
 
-## Decisões arquiteturais
+## Design Decisions
 
-| Decisão | Escolha | Motivo |
+| Decision | Choice | Rationale |
 |---|---|---|
-| Formato de dados | Parquet particionado (year/month/day) | Streaming eficiente, columnar para ML |
-| Compressão exportação | Snappy | Velocidade de escrita na exportação |
-| Compressão wide | Zstd nível 3 | Melhor ratio para floats correlacionados |
-| Janela de contexto | 512 amostras (~8.5s a 60 Hz) | Padrão TSPulse, cobre transitórios de rede |
-| Stride | 60 amostras (1s) | Resolução de 1s para alertas operacionais |
-| Modelo | TSPulse (IBM Granite) | #1 benchmark TSB-AD, zero-shot, 1 M params |
-| Estratégia | Fine-tuning em dados normais | Sem rótulos — aprende distribuição normal |
-| Hardware cloud | vast.ai H100 80 GB | Custo baixo vs. AWS/GCP |
+| Storage format | Partitioned Parquet (year/month/day) | Efficient streaming, columnar layout for ML workloads |
+| Export compression | Snappy | Fast writes during export |
+| Wide format compression | Zstd level 3 | Better ratio for correlated float channels |
+| Context window | 512 samples (~8.5s at 60 Hz) | TSPulse default; covers typical grid transients |
+| Stride | 60 samples (1s) | 1-second resolution for operational alerting |
+| Model | TSPulse (IBM Granite) | #1 on TSB-AD benchmark, zero-shot, 1M params |
+| Training strategy | Fine-tune on normal data only | No labeled anomalies needed — learns normal distribution |
+| Cloud hardware | vast.ai H100 80 GB | Low cost vs. AWS/GCP for GPU-intensive workloads |
