@@ -13,14 +13,17 @@ Uso:
         --input  D:/openHistorian_export \
         --output D:/export_wide \
         --signals configs/signals.json \
-        [--year 2022] [--month 3]
+        [--year 2022] [--month 3] [--workers 4]
 
 Sem --year/--month processa todos os anos/meses encontrados.
+--workers paraleliza por processo entre partições (year, month), que são
+independentes entre si.
 """
 
 import argparse
 import json
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -59,20 +62,19 @@ def pivot_partition(
 
     log.info("Pivotando %04d-%02d (%d dias) ...", year, month, len(day_files))
 
-    frames: list[pd.DataFrame] = []
-    for day_file in day_files:
-        df = pd.read_parquet(day_file, columns=["timestamp_us", "point_id", "value"])
-        # Pivot: linhas = timestamps, colunas = point_ids
-        wide = df.pivot_table(
-            index="timestamp_us",
-            columns="point_id",
-            values="value",
-            aggfunc="first",   # em caso de duplicatas, pegar o primeiro
-        )
-        wide.columns = [str(c) for c in wide.columns]
-        frames.append(wide)
+    frames: list[pd.DataFrame] = [
+        pd.read_parquet(day_file, columns=["timestamp_us", "point_id", "value"])
+        for day_file in day_files
+    ]
+    long_df = pd.concat(frames, ignore_index=True)
 
-    combined = pd.concat(frames).sort_index()
+    # Em caso de duplicatas de (timestamp_us, point_id), mantém a primeira —
+    # mesma semântica do antigo pivot_table(aggfunc="first"), mas dropar antes
+    # de um único unstake do mês é mais barato que N pivot_table (um por dia)
+    # seguidos de concat.
+    long_df.drop_duplicates(subset=["timestamp_us", "point_id"], keep="first", inplace=True)
+    combined = long_df.set_index(["timestamp_us", "point_id"])["value"].unstack("point_id").sort_index()
+    combined.columns = [str(c) for c in combined.columns]
 
     # Garantir que todas as colunas esperadas existam (preencher NaN se PMU offline)
     expected_cols = [str(pid) for pid in point_id_list]
@@ -97,6 +99,7 @@ def main():
     parser.add_argument("--signals", default="configs/signals.json",    help="Arquivo de sinais")
     parser.add_argument("--year",    type=int, default=None,            help="Processar apenas este ano")
     parser.add_argument("--month",   type=int, default=None,            help="Processar apenas este mês")
+    parser.add_argument("--workers", type=int, default=4,                help="Processos paralelos (partições year/month são independentes)")
     args = parser.parse_args()
 
     with open(args.signals, encoding="utf-8") as f:
@@ -121,8 +124,19 @@ def main():
                 partitions.append((year, month))
 
     log.info("Partições a processar: %d", len(partitions))
-    for year, month in partitions:
-        pivot_partition(input_dir, output_dir, year, month, point_id_list)
+
+    n_workers = max(1, min(args.workers, len(partitions))) if partitions else 1
+    if n_workers <= 1:
+        for year, month in partitions:
+            pivot_partition(input_dir, output_dir, year, month, point_id_list)
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = [
+                pool.submit(pivot_partition, input_dir, output_dir, year, month, point_id_list)
+                for year, month in partitions
+            ]
+            for future in as_completed(futures):
+                future.result()
 
     log.info("Pivotamento concluído.")
 

@@ -74,7 +74,17 @@ DEVICE_COUNTRY = {
 
 ---
 
-### Phase 2 — Data Export (run locally with VPN active)
+### Phase 2 — Data Export
+
+> **Run this phase from a machine on the same local network as the openHistorian
+> server, if you have access to one — not over VPN.** The export is bound by
+> single-record decode throughput of the SNAPdb protocol client and, secondarily,
+> by the link to the server; a VPN hop adds latency/bandwidth limits for no benefit.
+> Only the final Parquet output (15–25 GB total) needs to cross the VPN afterward
+> (e.g., via `rsync`), which is fast. A bigger cloud instance (AWS or otherwise)
+> does **not** help this phase — the bottleneck is single-core Python decode of the
+> historian protocol, not raw CPU/RAM, and a cloud VM is not any closer to your
+> historian than your own network.
 
 #### 2. Export openHistorian data to Parquet
 
@@ -88,18 +98,28 @@ python scripts/02_export_to_parquet.py \
     --end   2022-01-02 \
     --output D:/openHistorian_export
 
-# Full export (can be split by semester and run in parallel):
+# Full export, parallelized across N worker processes (each opens its own
+# connection and handles a contiguous slice of days):
 python scripts/02_export_to_parquet.py \
     --host  192.168.x.x \
     --start 2022-01-01 \
     --end   2024-01-01 \
-    --output D:/openHistorian_export
+    --output D:/openHistorian_export \
+    --workers 8
 ```
 
-> The script automatically resumes from the last successfully exported day on failure.
+> The script automatically resumes from the last successfully exported day on
+> failure — each day is one file, so parallel workers never write the same file.
 >
 > Estimated volume (10 PMUs × 8 channels, 2 years): **15–25 GB** in Parquet Snappy.
-> To speed things up, run two processes in parallel with distinct semesters.
+>
+> **Calibrating `--workers`:** decoding is CPU-bound Python (no C extension does
+> the record decode), so parallel processes give a close-to-linear speedup up to
+> your core count — but the openHistorian server also needs to sustain that many
+> concurrent connections without contention. Before a full backfill, benchmark a
+> single day with `--workers` at 2, 4, 8, and 16, watching local CPU and the
+> server's CPU/disk. Stop increasing once wall-clock time stops improving or the
+> server shows contention; use that value for the real run.
 
 **Verify:**
 
@@ -117,10 +137,14 @@ Groups point IDs as columns. Output: `D:/export_wide/year=YYYY/month=MM/data.par
 ```bash
 python scripts/03_pivot_wide.py \
     --input  D:/openHistorian_export \
-    --output D:/export_wide
+    --output D:/export_wide \
+    --workers 8
 ```
 
 > To process a specific month only: `--year 2022 --month 3`
+>
+> `--workers` parallelizes across `(year, month)` partitions, which are
+> independent of each other — same calibration approach as phase 2 applies.
 
 **Verify:**
 
@@ -254,6 +278,8 @@ power-anomaly-detection/
 |---|---|---|
 | Storage format | Partitioned Parquet (year/month/day) | Efficient streaming, columnar layout for ML workloads |
 | Export compression | Snappy | Fast writes during export |
+| Export parallelism | Multi-process (`--workers`), split by date range/partition | SNAPdb protocol decode is single-core Python (no bulk/vectorized read API); processes bypass the GIL where threads couldn't |
+| Export network path | Local network to the historian, not VPN | Bottleneck is decode throughput + link to server, not raw compute; VPN adds latency for no gain, and only the small final Parquet needs to cross it |
 | Wide format compression | Zstd level 3 | Better ratio for correlated float channels |
 | Context window | 512 samples (~8.5s at 60 Hz) | TSPulse default; covers typical grid transients |
 | Stride | 60 samples (1s) | 1-second resolution for operational alerting |
