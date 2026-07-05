@@ -13,11 +13,16 @@ Uso:
         --input  D:/openHistorian_export \
         --output D:/export_wide \
         --signals configs/signals.json \
-        [--year 2022] [--month 3] [--workers 4]
+        [--year 2022] [--month 3] [--workers 4] [--grid-hz 60]
 
 Sem --year/--month processa todos os anos/meses encontrados.
 --workers paraleliza por processo entre partições (year, month), que são
 independentes entre si.
+
+--grid-hz {50,60} deve bater com o que foi usado em 02_export_to_parquet.py:
+lê de INPUT_DIR/hz=50|60/... e grava em OUTPUT_DIR/hz=50|60/..., e restringe as
+colunas esperadas ao point_id_list daquela frequência (via by_grid_hz em
+configs/signals.json). Sem --grid-hz, lê/grava na raiz como antes.
 """
 
 import argparse
@@ -100,14 +105,26 @@ def main():
     parser.add_argument("--year",    type=int, default=None,            help="Processar apenas este ano")
     parser.add_argument("--month",   type=int, default=None,            help="Processar apenas este mês")
     parser.add_argument("--workers", type=int, default=4,                help="Processos paralelos (partições year/month são independentes)")
+    parser.add_argument("--grid-hz", type=int, default=None, choices=[50, 60], help="Deve bater com o --grid-hz usado na exportação (60=Brasil, 50=demais países)")
     args = parser.parse_args()
 
     with open(args.signals, encoding="utf-8") as f:
         signals_cfg = json.load(f)
-    point_id_list: list[int] = signals_cfg["all_point_ids"]
 
-    input_dir  = Path(args.input)
-    output_dir = Path(args.output)
+    if args.grid_hz is not None:
+        if "by_grid_hz" not in signals_cfg:
+            log.error(
+                "configs/signals.json não tem 'by_grid_hz' — re-execute 01_list_signals.py "
+                "(versão atualizada) antes de usar --grid-hz."
+            )
+            raise SystemExit(1)
+        point_id_list: list[int] = signals_cfg["by_grid_hz"].get(str(args.grid_hz), [])
+    else:
+        point_id_list = signals_cfg["all_point_ids"]
+
+    hz_subdir = f"hz={args.grid_hz}" if args.grid_hz is not None else ""
+    input_dir  = Path(args.input) / hz_subdir
+    output_dir = Path(args.output) / hz_subdir
 
     # Descobrir partições disponíveis
     if args.year and args.month:

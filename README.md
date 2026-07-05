@@ -62,15 +62,22 @@ python scripts/01_list_signals.py --host 192.168.x.x
 
 This creates/updates `configs/signals.json` with all PMU point IDs.
 
-**Manual step:** open `scripts/01_list_signals.py` and fill in the `DEVICE_COUNTRY` dictionary with each PMU's acronym and country. Example:
+**Manual step:** open `scripts/01_list_signals.py` and add any new PMU acronym to the `DEVICE_COUNTRY` dictionary as the network grows (currently covers Brazil, Chile, Argentina, Uruguay, Portugal, Italy, and Switzerland). Any device not listed falls into `"Unknown"` — check the printed summary after running the script and add missing entries:
 
 ```python
 DEVICE_COUNTRY = {
-    "UCHILE01": "Chile",
-    "USACH01":  "Chile",
-    "UBA01":    "Argentina",
+    "UDA":   "Chile",
+    "UNLP":  "Argentina",
+    "UTEC":  "Uruguay",
+    "UFSC":  "Brazil",
+    # ...
 }
 ```
+
+Each point ID also gets a `grid_hz` (50 or 60), derived from its country — **Brazil
+is the only 60 Hz grid in this dataset; everything else is 50 Hz.** This feeds the
+`--grid-hz` flag used in phases 2 and 3 below to keep the two sampling rates from
+being mixed into the same dataset.
 
 ---
 
@@ -99,13 +106,17 @@ python scripts/02_export_to_parquet.py \
     --output D:/openHistorian_export
 
 # Full export, parallelized across N worker processes (each opens its own
-# connection and handles a contiguous slice of days):
+# connection and handles a contiguous slice of days), split by grid frequency
+# so 50 Hz and 60 Hz PMUs never end up in the same dataset:
 python scripts/02_export_to_parquet.py \
     --host  192.168.x.x \
     --start 2022-01-01 \
     --end   2024-01-01 \
     --output D:/openHistorian_export \
-    --workers 8
+    --workers 8 \
+    --grid-hz 60   # Brazil only; use --grid-hz 50 for all other countries
+
+# Without --grid-hz, all PMUs (both 50 Hz and 60 Hz) are exported together, as before.
 ```
 
 > The script automatically resumes from the last successfully exported day on
@@ -120,6 +131,14 @@ python scripts/02_export_to_parquet.py \
 > single day with `--workers` at 2, 4, 8, and 16, watching local CPU and the
 > server's CPU/disk. Stop increasing once wall-clock time stops improving or the
 > server shows contention; use that value for the real run.
+>
+> **`--grid-hz {50,60}`:** PMU sampling rate follows the grid's nominal frequency
+> — Brazil runs at 60 Hz, every other country in this dataset (Chile, Argentina,
+> Uruguay, Portugal, Italy, Switzerland) runs at 50 Hz. Mixing both into one wide
+> table doesn't make sense (different native sample rates), so use `--grid-hz` to
+> export each separately. Output goes to `OUTPUT_DIR/hz=50|60/year=.../...` — a
+> distinct subtree per frequency, so a 50 Hz and a 60 Hz run (or an old run
+> without `--grid-hz`) never collide or get skipped as "already exported".
 
 **Verify:**
 
@@ -138,13 +157,18 @@ Groups point IDs as columns. Output: `D:/export_wide/year=YYYY/month=MM/data.par
 python scripts/03_pivot_wide.py \
     --input  D:/openHistorian_export \
     --output D:/export_wide \
-    --workers 8
+    --workers 8 \
+    --grid-hz 60   # must match whatever --grid-hz was used in phase 2
 ```
 
 > To process a specific month only: `--year 2022 --month 3`
 >
 > `--workers` parallelizes across `(year, month)` partitions, which are
 > independent of each other — same calibration approach as phase 2 applies.
+>
+> `--grid-hz` must match the value used during export (both read/write
+> `.../hz=50|60/...`) and restricts the wide table's columns to that
+> frequency's point IDs. Omit it only if phase 2 was also run without it.
 
 **Verify:**
 
@@ -280,6 +304,7 @@ power-anomaly-detection/
 | Export compression | Snappy | Fast writes during export |
 | Export parallelism | Multi-process (`--workers`), split by date range/partition | SNAPdb protocol decode is single-core Python (no bulk/vectorized read API); processes bypass the GIL where threads couldn't |
 | Export network path | Local network to the historian, not VPN | Bottleneck is decode throughput + link to server, not raw compute; VPN adds latency for no gain, and only the small final Parquet needs to cross it |
+| Grid frequency split | `--grid-hz {50,60}` on export/pivot, namespaced under `hz=50\|60/` | Brazil's grid is 60 Hz, every other country in this dataset is 50 Hz — native sample rates differ, so they must not be merged into one wide table |
 | Wide format compression | Zstd level 3 | Better ratio for correlated float channels |
 | Context window | 512 samples (~8.5s at 60 Hz) | TSPulse default; covers typical grid transients |
 | Stride | 60 samples (1s) | 1-second resolution for operational alerting |

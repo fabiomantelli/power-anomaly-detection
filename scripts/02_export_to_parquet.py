@@ -8,12 +8,19 @@ Schema: timestamp_us (int64 UTC µs), point_id (uint64), value (float32), qualit
 Uso:
     python scripts/02_export_to_parquet.py --host 192.168.x.x \
         --start 2022-01-01 --end 2024-01-01 \
-        --output D:/openHistorian_export --workers 4
+        --output D:/openHistorian_export --workers 4 --grid-hz 60
 
 Suporte a retomada: dias já exportados são pulados automaticamente.
 --workers paraleliza por processo (cada worker cuida de um intervalo contíguo de
 dias com sua própria conexão ao openHistorian). Calibre o valor observando
 CPU/rede locais e a carga no servidor antes de rodar o backfill completo.
+
+--grid-hz {50,60} filtra point_id_list pela frequência nominal da rede elétrica
+(60 Hz = só Brasil; 50 Hz = demais países — ver by_grid_hz em configs/signals.json,
+gerado por 01_list_signals.py). Sem --grid-hz, exporta tudo junto como antes.
+Quando usado, a saída fica em OUTPUT_DIR/hz=50|60/year=.../month=.../day=.../data.parquet
+— uma subpasta por frequência, para nunca colidir com uma exportação da outra
+frequência nem com uma exportação antiga sem --grid-hz.
 """
 
 import argparse
@@ -133,12 +140,26 @@ def export_day(host: str, instance_name: str, point_id_list: list[int], date: da
     return total
 
 
+def day_output_path(output_dir: Path, date: datetime, grid_hz: int | None) -> Path:
+    """Caminho do arquivo do dia. Namespaced por hz=50|60 quando --grid-hz é usado,
+    para nunca colidir com uma exportação da outra frequência (ou sem filtro)."""
+    root = output_dir / f"hz={grid_hz}" if grid_hz is not None else output_dir
+    return (
+        root
+        / f"year={date.year}"
+        / f"month={date.month:02d}"
+        / f"day={date.day:02d}"
+        / "data.parquet"
+    )
+
+
 def export_date_chunk(
     host: str,
     instance_name: str,
     point_id_list: list[int],
     output_dir_str: str,
     date_isos: list[str],
+    grid_hz: int | None = None,
 ) -> int:
     """Executado em um processo worker: exporta uma lista de dias, sequencialmente.
 
@@ -150,13 +171,7 @@ def export_date_chunk(
     total = 0
     for date_iso in date_isos:
         date = datetime.strptime(date_iso, "%Y-%m-%d")
-        out_file = (
-            output_dir
-            / f"year={date.year}"
-            / f"month={date.month:02d}"
-            / f"day={date.day:02d}"
-            / "data.parquet"
-        )
+        out_file = day_output_path(output_dir, date, grid_hz)
         if out_file.exists():
             log.info("Pulando %s (já exportado)", date.date())
             continue
@@ -192,14 +207,25 @@ def main():
     parser.add_argument("--signals",  default="configs/signals.json",       help="Arquivo de sinais")
     parser.add_argument("--instance", default=None,                         help="Nome da instância openHistorian")
     parser.add_argument("--workers",  type=int, default=4,                  help="Processos paralelos (calibre contra o servidor antes do backfill completo)")
+    parser.add_argument("--grid-hz",  type=int, default=None, choices=[50, 60], help="Filtra por frequência da rede (60=Brasil, 50=demais países). Sem isso, exporta tudo.")
     args = parser.parse_args()
 
     with open(args.signals, encoding="utf-8") as f:
         signals_cfg = json.load(f)
 
-    point_id_list: list[int] = signals_cfg["all_point_ids"]
+    if args.grid_hz is not None:
+        if "by_grid_hz" not in signals_cfg:
+            log.error(
+                "configs/signals.json não tem 'by_grid_hz' — re-execute 01_list_signals.py "
+                "(versão atualizada) antes de usar --grid-hz."
+            )
+            raise SystemExit(1)
+        point_id_list: list[int] = signals_cfg["by_grid_hz"].get(str(args.grid_hz), [])
+    else:
+        point_id_list = signals_cfg["all_point_ids"]
+
     if not point_id_list:
-        log.error("all_point_ids vazio em %s — execute 01_list_signals.py primeiro", args.signals)
+        log.error("Nenhum point ID encontrado (signals=%s, grid_hz=%s) — execute 01_list_signals.py primeiro", args.signals, args.grid_hz)
         raise SystemExit(1)
 
     # Resolve o nome da instância uma vez antes do loop principal
@@ -231,11 +257,11 @@ def main():
 
     total_records = 0
     if len(chunks) == 1:
-        total_records = export_date_chunk(args.host, instance_name, point_id_list, str(output_dir), chunks[0])
+        total_records = export_date_chunk(args.host, instance_name, point_id_list, str(output_dir), chunks[0], args.grid_hz)
     else:
         with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
             futures = [
-                pool.submit(export_date_chunk, args.host, instance_name, point_id_list, str(output_dir), chunk)
+                pool.submit(export_date_chunk, args.host, instance_name, point_id_list, str(output_dir), chunk, args.grid_hz)
                 for chunk in chunks
             ]
             for future in as_completed(futures):
